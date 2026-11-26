@@ -155,6 +155,8 @@ export * from "../server/ingestion/modelMatch";
 export * from "./ingestion/modelVisibility";
 export * from "./ingestion/ingestionAttribution";
 export * from "./ingestion/processEventBatch";
+export * from "./ingestion/sampling";
+export * from "./ingestion/traceWriteBatch";
 export * from "../server/ingestion/validateAndInflateScore";
 export * from "./ingestion/extractToolsBackend";
 export { type OtelSpan } from "./normalized-io/parser";

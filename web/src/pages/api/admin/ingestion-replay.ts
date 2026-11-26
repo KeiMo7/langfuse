@@ -20,8 +20,9 @@ const IngestionReplayBody = z.object({
 type StandardReplayJob = TQueueJobTypes[QueueName.IngestionSecondaryQueue];
 type OtelReplayJob = TQueueJobTypes[QueueName.OtelIngestionQueue];
 
-type StandardReplayEventType =
-  TQueueJobTypes[QueueName.IngestionSecondaryQueue]["payload"]["data"]["type"];
+type StandardReplayEventType = NonNullable<
+  TQueueJobTypes[QueueName.IngestionSecondaryQueue]["payload"]["data"]["type"]
+>;
 
 const standardReplayEventTypes = new Set<StandardReplayEventType>(
   Object.values(eventTypes).filter((type): type is StandardReplayEventType =>

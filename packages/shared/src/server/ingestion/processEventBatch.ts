@@ -1,4 +1,3 @@
-/* oxlint-disable prefer-promise-reject-errors -- baseline before rule enablement */
 /* eslint-disable no-nested-ternary, @typescript-eslint/no-use-before-define */
 import { randomUUID } from "crypto";
 import { z } from "zod";
@@ -36,7 +35,16 @@ import {
   safeBlobKeySegment,
 } from "../services/safeBlobKeySegment";
 import { buildEventBucketPrefix } from "./eventBucketPath";
-import { isTraceIdInSample } from "./sampling";
+import {
+  computeTraceSamplingDecision,
+  resolveTraceSamplingDecision,
+  type TraceSamplingDecision,
+} from "./sampling";
+import {
+  getTraceIdFromEvents,
+  packTraceWriteBatches,
+  type TraceWriteItem,
+} from "./traceWriteBatch";
 import {
   createS3ThrottledIngestionError,
   isS3SlowDownError,
@@ -257,6 +265,109 @@ export const processEventBatch = async (
   );
 
   /********************
+   * SAMPLING DECISIONS *
+   ********************/
+  const projectId = authCheck.scope.projectId;
+  const sampledProjects = env.LANGFUSE_INGESTION_PROCESSING_SAMPLED_PROJECTS;
+  const samplingDecisionPromises = new Map<
+    string,
+    Promise<TraceSamplingDecision>
+  >();
+
+  const resolveSamplingDecision = (traceId: string) => {
+    let decisionPromise = samplingDecisionPromises.get(traceId);
+    if (!decisionPromise) {
+      decisionPromise = resolveTraceSamplingDecision({
+        projectId,
+        traceId,
+        sampleRate: sampledProjects.get(projectId),
+        redisClient: redis,
+      });
+      samplingDecisionPromises.set(traceId, decisionPromise);
+    }
+    return decisionPromise;
+  };
+
+  for (const group of Object.values(sortedBatchByEventBodyId)) {
+    const traceId = getTraceIdFromEvents(group.data);
+    if (traceId) {
+      await resolveSamplingDecision(traceId);
+    }
+  }
+
+  const samplingDecisions = new Map<string, TraceSamplingDecision>();
+  await Promise.all(
+    [...samplingDecisionPromises.entries()].map(async ([traceId, decision]) => {
+      samplingDecisions.set(traceId, await decision);
+    }),
+  );
+
+  const samplingEventCounts = new Map<string, number>();
+  for (const group of Object.values(sortedBatchByEventBodyId)) {
+    const traceId = getTraceIdFromEvents(group.data);
+    if (!traceId) {
+      const decision = computeTraceSamplingDecision({
+        projectId,
+        traceId: null,
+        sampleRate: sampledProjects.get(projectId),
+      });
+      recordIncrement("langfuse.ingestion.sampling", group.data.length, {
+        projectId,
+        sampling_decision: decision.keep ? "in" : "out",
+        reason: decision.reason,
+      });
+      continue;
+    }
+
+    samplingEventCounts.set(
+      traceId,
+      (samplingEventCounts.get(traceId) ?? 0) + group.data.length,
+    );
+  }
+
+  for (const [traceId, eventCount] of samplingEventCounts) {
+    const decision = samplingDecisions.get(traceId);
+    if (!decision) continue;
+
+    recordIncrement("langfuse.ingestion.sampling", eventCount, {
+      projectId,
+      sampling_decision: decision.keep ? "in" : "out",
+      reason: decision.reason,
+    });
+  }
+
+  const projectIdsToSkipS3List =
+    env.LANGFUSE_SKIP_S3_LIST_FOR_OBSERVATIONS_PROJECT_IDS?.split(",") ?? [];
+
+  const writeBatches = packTraceWriteBatches({
+    projectId,
+    decisions: samplingDecisions,
+    groups: Object.values(sortedBatchByEventBodyId).map((group) => ({
+      type: group.type,
+      eventBodyId: group.eventBodyId,
+      fileKey: group.key,
+      bucketPrefix: group.bucketPrefix,
+      events: group.data,
+      entityType: group.entityType,
+    })),
+    skipS3ListFor: (group) => {
+      const isDatasetRunItemEvent = group.entityType === "dataset_run_item";
+      const isObservationEvent = group.entityType === "observation";
+      const isOtelOrSkipS3Project =
+        source === "otel" || projectIdsToSkipS3List.includes(projectId);
+
+      return (
+        isDatasetRunItemEvent || (isObservationEvent && isOtelOrSkipS3Project)
+      );
+    },
+  });
+
+  const keptWriteItems: TraceWriteItem[] = [
+    ...writeBatches.batches.flatMap((batch) => batch.items),
+    ...writeBatches.oversized.flatMap((batch) => batch.items),
+  ];
+
+  /********************
    * ASYNC PROCESSING *
    ********************/
   let s3UploadErrored = false;
@@ -267,15 +378,14 @@ export const processEventBatch = async (
     // If a promise rejects, we log it below, but do not throw an error.
     // In this case, we upload the full batch into the Redis queue.
     const results = await Promise.allSettled(
-      Object.keys(sortedBatchByEventBodyId).map(async (id) => {
+      keptWriteItems.map(async (item) => {
         // We upload the event in an array to the S3 bucket grouped by the eventBodyId.
         // That way we batch updates from the same invocation into a single file and reduce
         // write operations on S3.
-        const { data, key, bucketPrefix } = sortedBatchByEventBodyId[id];
-        const bucketPath = `${bucketPrefix}${key}.json`;
+        const bucketPath = `${item.bucketPrefix}${item.fileKey}.json`;
         return getS3StorageServiceClient(
           env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
-        ).uploadJson(bucketPath, data);
+        ).uploadJson(bucketPath, item.events);
       }),
     );
     results.forEach((result) => {
@@ -326,80 +436,110 @@ export const processEventBatch = async (
     throw new Error("Redis not initialized, aborting event processing");
   }
 
-  const projectIdsToSkipS3List =
-    env.LANGFUSE_SKIP_S3_LIST_FOR_OBSERVATIONS_PROJECT_IDS?.split(",") ?? [];
+  const authCheckPayload = authCheck as {
+    validKey: true;
+    scope: {
+      projectId: string;
+      accessLevel: "project" | "scores";
+    };
+  };
 
-  await Promise.all(
-    Object.keys(sortedBatchByEventBodyId).map(async (id) => {
-      const eventData = sortedBatchByEventBodyId[id];
-      const shardingKey = `${authCheck.scope.projectId}-${eventData.eventBodyId}`;
-      const queue = IngestionQueue.getInstance({ shardingKey });
+  const enqueueLegacyItem = (item: TraceWriteItem, traceId: string | null) => {
+    const entityType = getClickhouseEntityType(item.type);
+    const shardingKey =
+      entityType === "score" && traceId
+        ? `${projectId}-${traceId}`
+        : `${projectId}-${item.eventBodyId}`;
+    const queue = IngestionQueue.getInstance({ shardingKey });
 
-      const isDatasetRunItemEvent = eventData.entityType === "dataset_run_item";
-      const isObservationEvent = eventData.entityType === "observation";
-
-      const isOtelOrSkipS3Project =
-        authCheck.scope.projectId !== null &&
-        (source === "otel" ||
-          projectIdsToSkipS3List.includes(authCheck.scope.projectId));
-
-      const shouldSkipS3List =
-        isDatasetRunItemEvent || (isObservationEvent && isOtelOrSkipS3Project);
-
-      const { isSampled, isSamplingConfigured } = isTraceIdInSample({
-        projectId: authCheck.scope.projectId,
-        event: eventData.data[0],
-      });
-
-      if (!isSampled) {
-        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
-          projectId: authCheck.scope.projectId ?? "<not set>",
-          sampling_decision: "out",
-        });
-
-        return;
-      }
-
-      if (isSamplingConfigured) {
-        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
-          projectId: authCheck.scope.projectId ?? "<not set>",
-          sampling_decision: "in",
-        });
-      }
-
-      return queue
-        ? queue.add(
-            QueueJobs.IngestionJob,
-            {
-              id: randomUUID(),
-              timestamp: new Date(),
-              name: QueueJobs.IngestionJob as const,
-              payload: {
-                data: {
-                  type: eventData.type,
-                  eventBodyId: eventData.eventBodyId,
-                  fileKey: eventData.key,
-                  skipS3List: shouldSkipS3List,
-                  forwardToEventsTable,
-                  bucketPrefix: eventData.bucketPrefix,
-                  ingestionApiKey: attribution.ingestionApiKey,
-                  ingestionSdkName: attribution.ingestionSdkName,
-                  ingestionSdkVersion: attribution.ingestionSdkVersion,
-                },
-                authCheck: authCheck as {
-                  validKey: true;
-                  scope: {
-                    projectId: string;
-                    accessLevel: "project" | "scores";
-                  };
-                },
+    return queue
+      ? queue.add(
+          QueueJobs.IngestionJob,
+          {
+            id: randomUUID(),
+            timestamp: new Date(),
+            name: QueueJobs.IngestionJob as const,
+            payload: {
+              data: {
+                ...(entityType === "score" && traceId ? { traceId } : {}),
+                type: item.type,
+                eventBodyId: item.eventBodyId,
+                fileKey: item.fileKey,
+                skipS3List: item.skipS3List,
+                forwardToEventsTable,
+                bucketPrefix: item.bucketPrefix,
+                ingestionApiKey: attribution.ingestionApiKey,
+                ingestionSdkName: attribution.ingestionSdkName,
+                ingestionSdkVersion: attribution.ingestionSdkVersion,
               },
+              authCheck: authCheckPayload,
             },
-            { delay: getDelay(delay, source, eventData.entityType) },
-          )
-        : Promise.reject("Failed to instantiate ingestion queue");
-    }),
-  );
+          },
+          {
+            delay:
+              entityType === "score" ? 0 : getDelay(delay, source, entityType),
+          },
+        )
+      : Promise.reject(new Error("Failed to instantiate ingestion queue"));
+  };
+
+  const enqueueWriteBatch = (batch: (typeof writeBatches.batches)[number]) => {
+    if (!batch.traceId) {
+      return Promise.reject(
+        new Error("Trace write batch is missing its trace id"),
+      );
+    }
+
+    const shardingKey = `${projectId}-${batch.traceId}`;
+    const queue = IngestionQueue.getInstance({ shardingKey });
+    const batchDelay = Math.max(
+      ...batch.items.map((item) =>
+        getDelay(delay, source, getClickhouseEntityType(item.type)),
+      ),
+    );
+    const items = batch.items.map(({ events: _events, ...item }) => item);
+
+    return queue
+      ? queue.add(
+          QueueJobs.IngestionJob,
+          {
+            id: randomUUID(),
+            timestamp: new Date(),
+            name: QueueJobs.IngestionJob as const,
+            payload: {
+              data: {
+                traceId: batch.traceId,
+                items,
+                forwardToEventsTable,
+                ingestionApiKey: attribution.ingestionApiKey,
+                ingestionSdkName: attribution.ingestionSdkName,
+                ingestionSdkVersion: attribution.ingestionSdkVersion,
+              },
+              authCheck: authCheckPayload,
+            },
+          },
+          { delay: batchDelay },
+        )
+      : Promise.reject(new Error("Failed to instantiate ingestion queue"));
+  };
+
+  for (let index = 0; index < writeBatches.oversized.length; index += 1) {
+    recordIncrement("langfuse.ingestion.write_batch_fallback", 1, {
+      projectId,
+      reason: "oversized_trace",
+    });
+  }
+
+  await Promise.all([
+    ...writeBatches.batches.map((batch) =>
+      batch.items.length >= 2
+        ? enqueueWriteBatch(batch)
+        : enqueueLegacyItem(batch.items[0], batch.traceId),
+    ),
+    ...writeBatches.oversized.flatMap((batch) =>
+      batch.items.map((item) => enqueueLegacyItem(item, batch.traceId)),
+    ),
+  ]);
 
   return aggregateBatchResult(
     validationErrors,

@@ -25,25 +25,66 @@ import { ProjectNotificationWebhookQueueEventSchema } from "./notifications/type
 
 export type { MonitorQueueEvent, MonitorQueueEventInput };
 
+export const IngestionBatchItemEvent = z.object({
+  type: z.enum(Object.values(eventTypes)),
+  eventBodyId: z.string(),
+  fileKey: z.string(),
+  bucketPrefix: z.string().optional(),
+  skipS3List: z.boolean().optional(),
+});
+
+export const INGESTION_BATCH_MIN_ITEMS = 2;
+export const INGESTION_BATCH_MAX_ITEMS = 256;
+
 export const IngestionEvent = z.object({
-  data: z.object({
-    type: z.enum(Object.values(eventTypes)),
-    eventBodyId: z.string(),
-    fileKey: z.string().optional(),
-    skipS3List: z.boolean().optional(),
-    forwardToEventsTable: z.boolean().optional(),
-    // Optional for rolling deploy compatibility with in-flight jobs created
-    // before ingestion attribution was added to the queue payload.
-    ingestionApiKey: z.string().optional(),
-    ingestionSdkName: z.string().optional(),
-    ingestionSdkVersion: z.string().optional(),
-    // Absolute S3 key prefix the producer used (ends with "/"). Set so the
-    // consumer never reconstructs the path and therefore can't drift from
-    // the producer when env values differ across containers. Optional for
-    // backward compatibility with in-flight jobs enqueued before this field
-    // existed — the consumer falls back to local reconstruction when absent.
-    bucketPrefix: z.string().optional(),
-  }),
+  data: z
+    .object({
+      traceId: z.string().optional(),
+      items: z
+        .array(IngestionBatchItemEvent)
+        .min(INGESTION_BATCH_MIN_ITEMS)
+        .max(INGESTION_BATCH_MAX_ITEMS)
+        .optional(),
+      type: z.enum(Object.values(eventTypes)).optional(),
+      eventBodyId: z.string().optional(),
+      fileKey: z.string().optional(),
+      skipS3List: z.boolean().optional(),
+      forwardToEventsTable: z.boolean().optional(),
+      // Optional for rolling deploy compatibility with in-flight jobs created
+      // before ingestion attribution was added to the queue payload.
+      ingestionApiKey: z.string().optional(),
+      ingestionSdkName: z.string().optional(),
+      ingestionSdkVersion: z.string().optional(),
+      // Absolute S3 key prefix the producer used (ends with "/"). Set so the
+      // consumer never reconstructs the path and therefore can't drift from
+      // the producer when env values differ across containers. Optional for
+      // backward compatibility with in-flight jobs enqueued before this field
+      // existed — the consumer falls back to local reconstruction when absent.
+      bucketPrefix: z.string().optional(),
+    })
+    .superRefine((data, ctx) => {
+      const hasItems = data.items !== undefined;
+      const hasLegacyIdentity =
+        data.type !== undefined && data.eventBodyId !== undefined;
+
+      if (hasItems && hasLegacyIdentity) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "Ingestion payload must use either items or type/eventBodyId, not both",
+          path: ["items"],
+        });
+      }
+
+      if (!hasItems && !hasLegacyIdentity) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "Ingestion payload must contain either items or both type and eventBodyId",
+          path: ["eventBodyId"],
+        });
+      }
+    }),
   authCheck: z.object({
     validKey: z.literal(true),
     scope: z.object({
@@ -474,6 +515,9 @@ export type DatasetRunItemUpsertEventType = z.infer<
 export type EvalExecutionEventType = z.infer<typeof EvalExecutionEvent>;
 export type EvalJobExecutionEventType = z.infer<
   typeof EvalJobExecutionEventSchema
+>;
+export type IngestionBatchItemQueueType = z.infer<
+  typeof IngestionBatchItemEvent
 >;
 export type IngestionEventQueueType = z.infer<typeof IngestionEvent>;
 export type OtelIngestionEventQueueType = z.infer<typeof OtelIngestionEvent>;

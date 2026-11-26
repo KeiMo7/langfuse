@@ -5,11 +5,13 @@ import {
   clickhouseClient,
   getBlobStorageByProjectAndEntityId,
   getObservationById,
+  getS3EventStorageClient,
   getScoreById,
   getTraceById,
   createOrgProjectAndApiKey,
   ingestionEvent,
 } from "@langfuse/shared/src/server";
+import { env as sharedEnv } from "@langfuse/shared/src/env";
 import { v4 } from "uuid";
 
 describe("ingestion timestamp compatibility", () => {
@@ -1047,4 +1049,129 @@ describe("/api/public/ingestion API Endpoint", () => {
       expect(score!.comment).toBe(null);
     });
   }, 10000);
+});
+
+const SAMPLING_DROP_PROJECT_ID = "00000000-0000-4000-8000-0000000000a1";
+const SAMPLING_KEEP_PROJECT_ID = "00000000-0000-4000-8000-0000000000a2";
+
+describe("ingestion trace sampling", () => {
+  beforeAll(() => {
+    sharedEnv.LANGFUSE_INGESTION_PROCESSING_SAMPLED_PROJECTS.set(
+      SAMPLING_DROP_PROJECT_ID,
+      0,
+    );
+    sharedEnv.LANGFUSE_INGESTION_PROCESSING_SAMPLED_PROJECTS.set(
+      SAMPLING_KEEP_PROJECT_ID,
+      1,
+    );
+  });
+
+  it("returns 201 for dropped traces without S3 objects and uploads kept bodies", async () => {
+    const [dropFixture, keepFixture] = await Promise.all([
+      createOrgProjectAndApiKey({ projectId: SAMPLING_DROP_PROJECT_ID }),
+      createOrgProjectAndApiKey({ projectId: SAMPLING_KEEP_PROJECT_ID }),
+    ]);
+
+    const droppedTraceId = randomUUID();
+    const keptTraceId = randomUUID();
+    const droppedBatch = [
+      {
+        id: randomUUID(),
+        type: "trace-create",
+        timestamp: new Date().toISOString(),
+        body: { id: droppedTraceId, timestamp: new Date().toISOString() },
+      },
+      {
+        id: randomUUID(),
+        type: "span-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: randomUUID(),
+          traceId: droppedTraceId,
+          name: "dropped-span",
+        },
+      },
+      {
+        id: randomUUID(),
+        type: "generation-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: randomUUID(),
+          traceId: droppedTraceId,
+          name: "dropped-generation",
+        },
+      },
+    ];
+    const keptBatch = [
+      {
+        id: randomUUID(),
+        type: "trace-create",
+        timestamp: new Date().toISOString(),
+        body: { id: keptTraceId, timestamp: new Date().toISOString() },
+      },
+      {
+        id: randomUUID(),
+        type: "span-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: randomUUID(),
+          traceId: keptTraceId,
+          name: "kept-span",
+        },
+      },
+      {
+        id: randomUUID(),
+        type: "generation-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: randomUUID(),
+          traceId: keptTraceId,
+          name: "kept-generation",
+        },
+      },
+    ];
+
+    const dropResponse = await makeAPICall(
+      "POST",
+      "/api/public/ingestion",
+      { batch: droppedBatch },
+      dropFixture.auth,
+    );
+    const keepResponse = await makeAPICall(
+      "POST",
+      "/api/public/ingestion",
+      { batch: keptBatch },
+      keepFixture.auth,
+    );
+
+    expect(dropResponse.status).toBe(207);
+    expect(dropResponse.body.errors).toEqual([]);
+    expect(dropResponse.body.successes).toHaveLength(3);
+    expect(
+      dropResponse.body.successes.every(
+        (result: { status: number }) => result.status === 201,
+      ),
+    ).toBe(true);
+
+    expect(keepResponse.status).toBe(207);
+    expect(keepResponse.body.errors).toEqual([]);
+    expect(keepResponse.body.successes).toHaveLength(3);
+
+    const s3Client = getS3EventStorageClient(
+      sharedEnv.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
+    );
+    const listProjectObjects = async (projectId: string) =>
+      s3Client.listFiles(
+        `${sharedEnv.LANGFUSE_S3_EVENT_UPLOAD_PREFIX}${projectId}/`,
+      );
+
+    await expect(
+      listProjectObjects(SAMPLING_DROP_PROJECT_ID),
+    ).resolves.toHaveLength(0);
+
+    await waitForExpect(async () => {
+      const objects = await listProjectObjects(SAMPLING_KEEP_PROJECT_ID);
+      expect(objects).toHaveLength(3);
+    });
+  }, 20_000);
 });
